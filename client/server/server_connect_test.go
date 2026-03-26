@@ -185,3 +185,95 @@ func TestConnectClient_EngineNilOnFreshClient(t *testing.T) {
 	client := newDummyConnectClient(context.Background())
 	assert.Nil(t, client.Engine(), "engine should be nil on fresh ConnectClient")
 }
+
+// newStateTestServer creates a test server with a properly initialized state context,
+// required for tests that call Up() or check connection state.
+func newStateTestServer() *Server {
+	ctx := internal.CtxInitState(context.Background())
+	return &Server{
+		rootCtx:        ctx,
+		statusRecorder: peer.NewRecorder(""),
+	}
+}
+
+// TestUp_WhenConnected_ReturnsImmediately verifies that Up() returns success immediately
+// without tearing down an existing healthy connection when status is Connected.
+// This prevents unnecessary tunnel disruption when Up() is called while already connected.
+func TestUp_WhenConnected_ReturnsImmediately(t *testing.T) {
+	s := newStateTestServer()
+
+	cancelCalled := false
+	s.clientRunning = true
+	s.clientRunningChan = make(chan struct{})
+	close(s.clientRunningChan) // already connected
+	s.clientGiveUpChan = make(chan struct{})
+	s.actCancel = func() {
+		cancelCalled = true
+	}
+
+	// Set state to Connected
+	internal.CtxGetState(s.rootCtx).Set(internal.StatusConnected)
+
+	ctx, ctxCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer ctxCancel()
+
+	resp, err := s.Up(ctx, &proto.UpRequest{})
+	require.NoError(t, err)
+	assert.NotNil(t, resp, "Up() should return a response when already connected")
+	assert.False(t, cancelCalled, "actCancel should NOT be called when tunnel is already connected")
+}
+
+// TestUp_WhenStaleConnection_CancelsExistingGoroutine verifies that Up() cancels
+// the stale goroutine and waits for it to exit when the connection is not in
+// Connected state (e.g. after session expiry and successful re-auth).
+// Before the fix, Up() would return a false success via the already-closed
+// clientRunningChan without establishing a new tunnel.
+func TestUp_WhenStaleConnection_CancelsExistingGoroutine(t *testing.T) {
+	s := newStateTestServer()
+
+	cancelCalled := make(chan struct{}, 1)
+	giveUpChan := make(chan struct{})
+
+	s.clientRunning = true
+	s.clientRunningChan = make(chan struct{})
+	close(s.clientRunningChan) // stale — closed from the original connection
+	s.clientGiveUpChan = giveUpChan
+	s.actCancel = func() {
+		select {
+		case cancelCalled <- struct{}{}:
+		default:
+		}
+	}
+
+	// Set state to Idle — as it is after WaitSSOLogin completes successfully
+	internal.CtxGetState(s.rootCtx).Set(internal.StatusIdle)
+
+	// Simulate connectWithRetryRuns exiting: sets clientRunning=false and closes giveUpChan
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		s.mutex.Lock()
+		s.clientRunning = false
+		s.mutex.Unlock()
+		close(giveUpChan)
+	}()
+
+	ctx, ctxCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer ctxCancel()
+
+	// Run Up() in a goroutine — it will cancel the stale goroutine, wait for
+	// giveUpChan, then fail on nil profileManager. We only care that cancel was called.
+	upDone := make(chan struct{})
+	go func() {
+		defer close(upDone)
+		//nolint:errcheck
+		s.Up(ctx, &proto.UpRequest{}) //nolint:errcheck — expected to fail on nil profileManager
+	}()
+
+	// The critical assertion: actCancel must be called before Up() tries to reconnect
+	select {
+	case <-cancelCalled:
+		// correct — stale goroutine was cancelled
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("actCancel should have been called to tear down the stale goroutine")
+	}
+}

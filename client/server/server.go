@@ -203,6 +203,21 @@ func (s *Server) Start() error {
 	s.clientRunningChan = make(chan struct{})
 	s.clientGiveUpChan = make(chan struct{})
 	go s.connectWithRetryRuns(ctx, config, s.statusRecorder, s.clientRunningChan, s.clientGiveUpChan)
+
+	// Mark session active when the auto-started engine connects successfully.
+	// Without this, isSessionActive stays false and the daemon never reports
+	// StatusSessionExpired (only StatusNeedsLogin), so the re-auth popup never appears.
+	runningChan := s.clientRunningChan
+	giveUpChan := s.clientGiveUpChan
+	go func() {
+		select {
+		case <-runningChan:
+			s.isSessionActive.Store(true)
+		case <-giveUpChan:
+		case <-ctx.Done():
+		}
+	}()
+
 	return nil
 }
 
@@ -249,6 +264,12 @@ func (s *Server) connectWithRetryRuns(ctx context.Context, profileConfig *profil
 		err := s.connect(ctx, profileConfig, statusRecorder, runningChan)
 		if err != nil {
 			log.Debugf("run client connection exited with error: %v. Will retry in the background", err)
+			// PermissionDenied means the session expired and login is required.
+			// The inner retry already stripped the permanent wrapper, so re-wrap it here
+			// to prevent the outer backoff from sleeping 30+ minutes before giving up.
+			if st, ok := gstatus.FromError(err); ok && st.Code() == codes.PermissionDenied {
+				return backoff.Permanent(err)
+			}
 			return err
 		}
 
@@ -643,12 +664,31 @@ func (s *Server) Up(callerCtx context.Context, msg *proto.UpRequest) (*proto.UpR
 			s.mutex.Unlock()
 			return nil, err
 		}
-		if status == internal.StatusNeedsLogin {
+
+		// If already fully connected, return success immediately — no work needed.
+		if status == internal.StatusConnected {
+			s.mutex.Unlock()
+			return &proto.UpResponse{}, nil
+		}
+
+		// For any non-connected state (SessionExpired, NeedsLogin, Idle, etc.),
+		// tear down the stale goroutine before starting a fresh connection.
+		// Without this, waitForUp returns instantly via the already-closed clientRunningChan
+		// (closed when the engine first started), falsely reporting success with no tunnel.
+		giveUpChan := s.clientGiveUpChan
+		if s.actCancel != nil {
 			s.actCancel()
 		}
 		s.mutex.Unlock()
 
-		return s.waitForUp(callerCtx)
+		select {
+		case <-giveUpChan:
+		case <-time.After(5 * time.Second):
+			log.Warn("timed out waiting for old connection goroutine to exit")
+		}
+
+		s.mutex.Lock()
+		// clientRunning is now false (set by connectWithRetryRuns defer), fall through to fresh start
 	}
 	if err := restoreResidualState(callerCtx, s.profileManager.GetStatePath()); err != nil {
 		log.Warnf(errRestoreResidualState, err)

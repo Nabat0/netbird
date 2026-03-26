@@ -212,9 +212,13 @@ func (r *SysOps) genericAddVPNRoute(prefix netip.Prefix, intf *net.Interface) er
 
 	switch prefix {
 	case vars.Defaultv4:
+		// Remove any stale split routes before adding — handles reconnect after session expiry
+		// where cleanup completed but the OS routing table still has leftover entries.
+		_ = r.removeFromRouteTable(splitDefaultv4_1, nextHop)
 		if err := r.addToRouteTable(splitDefaultv4_1, nextHop); err != nil {
 			return err
 		}
+		_ = r.removeFromRouteTable(splitDefaultv4_2, nextHop)
 		if err := r.addToRouteTable(splitDefaultv4_2, nextHop); err != nil {
 			if err2 := r.removeFromRouteTable(splitDefaultv4_1, nextHop); err2 != nil {
 				log.Warnf("Failed to rollback route addition: %s", err2)
@@ -223,9 +227,11 @@ func (r *SysOps) genericAddVPNRoute(prefix netip.Prefix, intf *net.Interface) er
 		}
 
 		// TODO: remove once IPv6 is supported on the interface
+		_ = r.removeFromRouteTable(splitDefaultv6_1, nextHop)
 		if err := r.addToRouteTable(splitDefaultv6_1, nextHop); err != nil {
 			return fmt.Errorf("add unreachable route split 1: %w", err)
 		}
+		_ = r.removeFromRouteTable(splitDefaultv6_2, nextHop)
 		if err := r.addToRouteTable(splitDefaultv6_2, nextHop); err != nil {
 			if err2 := r.removeFromRouteTable(splitDefaultv6_1, nextHop); err2 != nil {
 				log.Warnf("Failed to rollback route addition: %s", err2)
@@ -235,9 +241,11 @@ func (r *SysOps) genericAddVPNRoute(prefix netip.Prefix, intf *net.Interface) er
 
 		return nil
 	case vars.Defaultv6:
+		_ = r.removeFromRouteTable(splitDefaultv6_1, nextHop)
 		if err := r.addToRouteTable(splitDefaultv6_1, nextHop); err != nil {
 			return fmt.Errorf("add unreachable route split 1: %w", err)
 		}
+		_ = r.removeFromRouteTable(splitDefaultv6_2, nextHop)
 		if err := r.addToRouteTable(splitDefaultv6_2, nextHop); err != nil {
 			if err2 := r.removeFromRouteTable(splitDefaultv6_1, nextHop); err2 != nil {
 				log.Warnf("Failed to rollback route addition: %s", err2)

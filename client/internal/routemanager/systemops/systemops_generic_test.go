@@ -632,3 +632,41 @@ func TestIsVpnRoute(t *testing.T) {
 		})
 	}
 }
+
+// TestAddVPNRoute_ReconnectSucceeds verifies that calling AddVPNRoute for the default
+// route (0.0.0.0/0) a second time without an intervening remove succeeds without a
+// "file exists" error. This simulates the reconnect-after-session-expiry scenario
+// where the OS routing table retains stale split /1 entries (::/1, 8000::/1) after
+// the WireGuard interface is torn down, because these unreachable placeholder routes
+// are not tied to the interface and are not auto-cleaned by the OS.
+func TestAddVPNRoute_ReconnectSucceeds(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("route manipulation requires admin privileges on Windows CI")
+	}
+
+	t.Setenv("NB_DISABLE_ROUTE_CACHE", "true")
+
+	wgInterface := createWGInterface(t, fmt.Sprintf("utun5390"), "100.65.75.2/24", 33190)
+
+	r := New(wgInterface, nil)
+	advancedRouting := nbnet.AdvancedRouting()
+	err := r.SetupRouting(nil, nil, advancedRouting)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		assert.NoError(t, r.CleanupRouting(nil, advancedRouting))
+	})
+
+	intf, err := net.InterfaceByName(wgInterface.Name())
+	require.NoError(t, err)
+
+	// First add — simulates initial connection
+	err = r.AddVPNRoute(netip.MustParsePrefix("0.0.0.0/0"), intf)
+	require.NoError(t, err, "first AddVPNRoute for default route should succeed")
+
+	// Second add WITHOUT removing first — simulates reconnect after session expiry
+	// where OS cleanup completed but stale split routes (::/1, 8000::/1) remain.
+	// Before fix: fails with "add route for ::/1: write: file exists"
+	// After fix: remove-before-add clears stale entries, succeeds.
+	err = r.AddVPNRoute(netip.MustParsePrefix("0.0.0.0/0"), intf)
+	assert.NoError(t, err, "second AddVPNRoute (reconnect with stale routes) should succeed")
+}
